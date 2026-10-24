@@ -10,36 +10,17 @@
 #include "driver/gpio.h"
 #include "relay.h"
 #include "esp_log.h"
+#include "button_led_via_intr.h"
 
 static const char *TAG = "RelayExample";
 
 // #define LOW_TANK_PIN 4
 // #define HIGH_TANK_PIN 19
-#define RELAY_PIN 19
 
 void app_main(void)
 {
-    gpio_config_t io_conf_low = {
-        .pin_bit_mask = (1ULL << RELAY_PIN),   // Select GPIO 4
-        .mode = GPIO_MODE_OUTPUT,              // Set as output
-        .pull_up_en = GPIO_PULLUP_DISABLE,     // Enable internal pull-up
-        .pull_down_en = GPIO_PULLDOWN_DISABLE, // Disable pull-down
-        .intr_type = GPIO_INTR_DISABLE         // Disable interrupts
-    };
-    gpio_config(&io_conf_low);
-
-    gpio_set_level(RELAY_PIN, 0);
-
-    while (1)
-    {
-        printf("Turn Relay ON\n");
-        gpio_set_level(RELAY_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 2 seconds
-
-        printf("Turn Relay OFF\n");
-        gpio_set_level(RELAY_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Wait 2 seconds
-    }
+    // button_control_led_init();
+    button_led_init();
 }
 
 // // OK code for float sensor

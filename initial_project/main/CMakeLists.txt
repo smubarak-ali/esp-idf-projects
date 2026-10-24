@@ -3,5 +3,5 @@ idf_component_register(
 
         INCLUDE_DIRS "."
 
-        PRIV_REQUIRES led_blink temperature water_level_reader
+        PRIV_REQUIRES led_blink temperature water_level_reader button_control_led button_led_via_intr
 )
