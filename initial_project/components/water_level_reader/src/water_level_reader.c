@@ -1,104 +1,222 @@
-#include <stdio.h>
-#include "stdbool.h"
+
 #include "water_level_reader.h"
-#include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_err.h"
-#include "esp_adc/adc_oneshot.h"
 
-#define SENSOR_ADC_CHANNEL ADC_CHANNEL_4 // GPIO32
-#define READ_INTERVAL_MS 1000
+#include <math.h>
+#include <string.h>
 
-adc_oneshot_unit_handle_t adc_handle; // Global handle for ADC unit
-
-// Calibration handle (optional)
-adc_cali_handle_t cali_handle = NULL;
-bool do_calibration = false;
-
-static const char *TAG = "ADC_SENSOR";
-
-esp_err_t water_level_reader_init()
+esp_err_t water_flow_monitor_init(
+    water_flow_monitor_t *m,
+    const water_flow_monitor_config_t *cfg)
 {
-    // Step 1: Initialize ADC1
-    adc_oneshot_unit_init_cfg_t unit_config = {
-        .unit_id = ADC_UNIT_1,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-
-    ESP_ERROR_CHECK(
-        adc_oneshot_new_unit(&unit_config, &adc_handle));
-
-    // Step 2: Configure GPIO32 as ADC input
-    adc_oneshot_chan_cfg_t channel_config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
-    };
-
-    ESP_ERROR_CHECK(
-        adc_oneshot_config_channel(
-            adc_handle,
-            SENSOR_ADC_CHANNEL,
-            &channel_config));
-
-    // 3. Setup Calibration (Optional but highly recommended for millivolt conversion)
-    adc_cali_line_fitting_config_t cali_config = {
-        .unit_id = ADC_UNIT_1,
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    // Check if calibration scheme is supported/burned into eFuse
-    esp_err_t cali_ret = adc_cali_create_scheme_line_fitting(&cali_config, &cali_handle);
-    if (cali_ret == ESP_OK)
+    if (!m || !cfg ||
+        !isfinite(cfg->flow_on_lpm) ||
+        !isfinite(cfg->flow_off_lpm) ||
+        cfg->flow_on_lpm <= 0 ||
+        cfg->flow_off_lpm < 0 ||
+        cfg->flow_off_lpm >= cfg->flow_on_lpm ||
+        cfg->startup_grace_ms == 0 ||
+        cfg->flow_confirm_ms == 0 ||
+        cfg->no_flow_confirm_ms == 0 ||
+        cfg->max_sample_gap_ms == 0)
     {
-        do_calibration = true;
-        ESP_LOGI(TAG, "Calibration initialized successfully.");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(m, 0, sizeof(*m));
+
+    m->config = *cfg;
+    m->state = WATER_FLOW_IDLE;
+
+    return ESP_OK;
+}
+
+void water_flow_monitor_start(
+    water_flow_monitor_t *m,
+    int64_t now_ms)
+{
+    if (!m)
+        return;
+
+    m->state = WATER_FLOW_STARTING;
+    m->started_ms = now_ms;
+    m->last_sample_ms = now_ms;
+
+    m->above_pending = false;
+    m->below_pending = false;
+    m->last_flow_lpm = 0;
+}
+
+void water_flow_monitor_stop(
+    water_flow_monitor_t *m)
+{
+    if (!m)
+        return;
+
+    m->state = WATER_FLOW_IDLE;
+    m->above_pending = false;
+    m->below_pending = false;
+}
+
+void water_flow_monitor_sensor_error(
+    water_flow_monitor_t *m)
+{
+    if (!m)
+        return;
+
+    m->state = WATER_FLOW_SENSOR_ERROR;
+    m->above_pending = false;
+    m->below_pending = false;
+}
+
+esp_err_t water_flow_monitor_update(
+    water_flow_monitor_t *m,
+    const yf_s401_reading_t *reading,
+    int64_t now_ms)
+{
+    if (!m || !reading)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (m->state == WATER_FLOW_IDLE)
+    {
+        return ESP_OK;
+    }
+
+    if (m->state == WATER_FLOW_SENSOR_ERROR)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Detect missed or excessively delayed samples.
+    int64_t gap_ms = now_ms - m->last_sample_ms;
+
+    if (gap_ms < 0 ||
+        gap_ms > m->config.max_sample_gap_ms)
+    {
+        water_flow_monitor_sensor_error(m);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    m->last_sample_ms = now_ms;
+
+    float flow = reading->flow_lpm;
+
+    if (!isfinite(flow) || flow < 0)
+    {
+        water_flow_monitor_sensor_error(m);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    m->last_flow_lpm = flow;
+
+    // --------------------------------------
+    // 1. Track sustained sufficient flow.
+    // --------------------------------------
+    if (flow >= m->config.flow_on_lpm)
+    {
+        if (!m->above_pending)
+        {
+            m->above_since_ms = now_ms;
+            m->above_pending = true;
+        }
     }
     else
     {
-        ESP_LOGW(TAG, "Calibration initialization failed. Proceeding without it.");
+        m->above_pending = false;
+    }
+
+    // --------------------------------------
+    // 2. Track sustained low/absent flow.
+    // --------------------------------------
+    if (flow <= m->config.flow_off_lpm)
+    {
+        if (!m->below_pending)
+        {
+            m->below_since_ms = now_ms;
+            m->below_pending = true;
+        }
+    }
+    else
+    {
+        m->below_pending = false;
+    }
+
+    // --------------------------------------
+    // 3. Confirm FLOWING.
+    // --------------------------------------
+    if (m->state == WATER_FLOW_STARTING ||
+        m->state == WATER_FLOW_NO_FLOW)
+    {
+
+        if (m->above_pending &&
+            now_ms - m->above_since_ms >=
+                m->config.flow_confirm_ms)
+        {
+
+            m->state = WATER_FLOW_FLOWING;
+            m->below_pending = false;
+
+            return ESP_OK;
+        }
+    }
+
+    // --------------------------------------
+    // 4. Check startup grace timeout.
+    // --------------------------------------
+    if (m->state == WATER_FLOW_STARTING)
+    {
+
+        if (now_ms - m->started_ms >=
+            m->config.startup_grace_ms)
+        {
+
+            m->state = WATER_FLOW_NO_FLOW;
+        }
+
+        return ESP_OK;
+    }
+
+    // --------------------------------------
+    // 5. Detect loss of established flow.
+    // --------------------------------------
+    if (m->state == WATER_FLOW_FLOWING)
+    {
+
+        if (m->below_pending &&
+            now_ms - m->below_since_ms >=
+                m->config.no_flow_confirm_ms)
+        {
+
+            m->state = WATER_FLOW_NO_FLOW;
+            m->above_pending = false;
+        }
     }
 
     return ESP_OK;
 }
 
-esp_err_t water_level_reader_read()
+const char *water_flow_monitor_state_name(
+    water_flow_state_t state)
 {
-    // Step 4: Continuously read analog values
-    while (1)
+    switch (state)
     {
-        int raw_value = 0;
-        int voltage_mv = 0;
+    case WATER_FLOW_IDLE:
+        return "IDLE";
 
-        esp_err_t result = adc_oneshot_read(
-            adc_handle,
-            SENSOR_ADC_CHANNEL,
-            &raw_value);
+    case WATER_FLOW_STARTING:
+        return "STARTING";
 
-        if (result == ESP_OK)
-        {
-            ESP_LOGI(TAG, "ADC Raw Value: %d", raw_value);
+    case WATER_FLOW_FLOWING:
+        return "FLOWING";
 
-            // Convert raw to millivolts using the calibration handle
-            if (do_calibration)
-            {
-                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali_handle, raw_value, &voltage_mv));
-                ESP_LOGI(TAG, "Calibrated Voltage: %d mV", voltage_mv);
-            }
-        }
-        else
-        {
-            ESP_LOGE(TAG, "ADC read failed: %s",
-                     esp_err_to_name(result));
-        }
+    case WATER_FLOW_NO_FLOW:
+        return "NO_FLOW";
 
-        // Delay without busy-waiting
-        vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
+    case WATER_FLOW_SENSOR_ERROR:
+        return "SENSOR_ERROR";
 
-        // 5. Clean up (Tear down handles if you ever exit the loop)
-        // ESP_ERROR_CHECK(adc_oneshot_del_unit(adc1_handle));
-        // if (do_calibration) {
-        //     ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(cali_handle));
-        // }
+    default:
+        return "UNKNOWN";
     }
 }
